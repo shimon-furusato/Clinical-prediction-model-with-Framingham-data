@@ -1,0 +1,197 @@
+---
+title: "framingham_imputation"
+author: "Shimon"
+date: "2024-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#library
+pacman::p_load(
+tidyverse,data.table,tableone,tibble,stringi,readxl,dplyr,scales,ggsci,
+skimr,Epi,janitor,summarytools,broom,easystats,car,rms)
+
+#conflict解消
+select<-dplyr::select 
+
+library(mice)
+library(missForest)
+library(doParallel)
+```
+
+```{r}
+#factor var
+fac_var<-c("SEX", "CURSMOKE", "DIABETES", "BPMEDS","educ","PREVCHD", "PREVAP", "PREVMI", "PREVSTRK", "PREVHYP", "PERIOD", "DEATH", 
+           "ANGINA", "HOSPMI", "MI_FCHD", "ANYCHD", "STROKE", "CVD", "HYPERTEN")
+
+cont_var<-c("TOTCHOL", "AGE", "SYSBP", "DIABP", "CIGPDAY", "BMI", "HEARTRTE", "GLUCOSE")
+
+var<-c("SEX", "CURSMOKE", "DIABETES", "BPMEDS", "PREVCHD", "PREVAP", "PREVMI", "PREVSTRK", "PREVHYP", cont_var)
+
+inter_var<-c("SEX:PREVCHD", "SEX:PREVAP", "SEX:PREVMI", "SEX:PREVHYP", "SEX:DIABP", "CURSMOKE:HEARTRTE","DIABETES:TOTCHOL", "DIABETES:SYSBP",
+             "BPMEDS:PREVCHD", "BPMEDS:TOTCHOL", "BPMEDS:AGE", "PREVCHD:GLUCOSE", "PREVHYP:BMI", "TOTCHOL:AGE","HEARTRTE:GLUCOSE")
+
+nonlin_term<-c("BMI","HEARTRTE","GLUCOSE")
+
+#data import
+fr<-read_csv("frmgham2.csv") %>% 
+  mutate(across(fac_var,as.factor))
+```
+
+
+```{r}
+fr %>% 
+  skim()
+```
+##欠測データのパターン評価
+```{r}
+library(naniar)
+
+#STROKEごとの欠測パターン
+fr %>% 
+  gg_miss_var(show_pct = TRUE,
+              facet=STROKE)
+
+#PERIODごとの欠測パターン
+fr %>% 
+  gg_miss_var(show_pct = TRUE,
+              facet=PERIOD)
+```
+- STROKEによって欠測パターンが変わるわけではない
+- PERIODによって欠測パターンは変わる：PERIOD3ではHDL,LDLの欠測率が著しく低下する→歴史的背景がある？（例：健診項目への導入など）
+
+```{r}
+fr %>% 
+  vis_miss(facet=PERIOD)
+```
+
+```{r}
+fr %>% 
+  naclus() %>% 
+  plot()
+
+fr %>% 
+  naclus() %>% 
+  naplot(which=c("all"))
+```
+
+- missing per obs: missing数のヒストグラム→２個欠損が最大
+- missing per var(2枚目)、三枚目:ある変数がmissingのとき、残りの変数の欠測状況がどれくらいか→HR欠測している場合、他にも3個以上欠測している可能性が高い
+→HRは受診時に測定される可能性が高そうなので、何らかの理由で身体検査以上の診察が行われなかったことを示唆しているかも？
+
+```{r}
+#mice実施のためのデータセット前処理
+#factor type variableのorderをset: PERIODのみ
+
+fr_miss<-fr %>%
+  select(-c("LDLC","HDLC")) %>% #補完しない項目を削除
+  mutate(PERIOD=as.ordered(PERIOD)) %>% #元々factor variableはすべて要素名が数字だったのでorderを明示しなくても昇順にしてくれる
+  as.data.frame()
+```
+
+
+## missForestによる多重代入
+https://www.slideshare.net/kato_kohaku/imputation-of-missing-values-using-random-forest
+```{r}
+#計算を高速化するために並列処理を行う
+# cores<-detectCores(logical=F)
+# registerDoParallel(cores=cores)
+# 
+# #扱うデータはtibbleではなく、data.frameでないとだめそう
+# #categorical変数が53以上（データ依存？）だと補完できない→患者IDはnumericにする必要があるか、予測に影響するならはずすべき
+# fr.missf<-missForest(xmis = fr_miss,
+#                      verbose = TRUE,
+#                      parallelize = "variables") #maxiter = 10, ntree = 100, parallelize:並列処理
+
+# save(fr.missf,file="fr.missf.RData")
+# 所要時間8minくらい
+
+load("fr.missf.RData")
+```
+
+```{r}
+#欠測補完後のデータの確認
+
+fr.missf$ximp %>% 
+  skim()
+
+fr.missf$ximp %>% 
+  select(-c(fac_var)) %>% 
+  pivot_longer(cols=everything(),
+               names_to = "term",
+               values_to = "value") %>% 
+  ggplot(aes(x=value))+
+  geom_histogram()+
+  facet_wrap(~term,scales = "free")+
+  #x軸の文字を小さくする
+  theme(axis.text.x = element_text(size=5))
+
+```
+
+# imputaiton data のcharacteristic
+```{r}
+CreateTableOne(vars=var,
+               factorVars=fac_var,
+               strata="STROKE",
+               data=fr.missf$ximp,
+               test=FALSE,
+               includeNA=TRUE) %>% 
+  print(missing = TRUE) %>% 
+  as.data.frame.matrix() %>% 
+  tibble::rownames_to_column(var = "Variables") %>% 
+  flextable::flextable()
+
+
+CreateTableOne(vars=var,
+               factorVars=fac_var,
+               strata="STROKE",
+               data=fr.missf_p1,
+               test=FALSE,
+               includeNA=TRUE) %>% 
+  print(missing = TRUE) %>% 
+  as.data.frame.matrix() %>% 
+  tibble::rownames_to_column(var = "Variables") %>% 
+  flextable::flextable()
+  
+
+library(flextable)
+```
+
+```{r}
+#ready-to-useなtableの出力
+library(gtsummary);library(gt)
+
+tbl<-
+fr.missf_p1 %>%
+  tbl_summary(
+    include = c(var,"STROKE"),
+    by=STROKE,
+    missing = "always",
+    missing_text = "Missing") %>% 
+  add_overall() %>% 
+  modify_spanning_header(starts_with("stat_")~"**STROKE**") %>%
+  bold_labels()
+
+tbl_split<-
+  fr.missf$ximp %>%
+  tbl_summary(
+    include = c(var,"STROKE"),
+    by=STROKE,
+    missing = "always",
+    missing_text = "Missing") %>% 
+  add_overall() %>% 
+  modify_spanning_header(starts_with("stat_")~"**STROKE**") %>%
+  bold_labels() %>% 
+  tbl_split(PREVHYP) 
+
+tbl %>% 
+  as_flex_table() %>% 
+  save_as_pptx(path="table.pptx")
+        
+```
+
+
