@@ -1,0 +1,283 @@
+---
+title: "framingham data clean up"
+author: "Shimon"
+date: "2024-02-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Data clean up
+
+```{r}
+#library
+pacman::p_load(
+tidyverse,data.table,tableone,tibble,stringi,readxl,dplyr,scales,ggsci,
+skimr,Epi,janitor,summarytools,broom,easystats,car,rms)
+
+#conflict解消
+select<-dplyr::select 
+```
+
+
+```{r}
+#factor var
+fac_var<-c("RANDID","SEX", "CURSMOKE", "DIABETES", "BPMEDS","educ","PREVCHD", "PREVAP", "PREVMI", "PREVSTRK", "PREVHYP", "PERIOD", "DEATH", 
+           "ANGINA", "HOSPMI", "MI_FCHD", "ANYCHD", "STROKE", "CVD", "HYPERTEN")
+
+#data import
+fr<-read_csv("frmgham2.csv") %>% 
+  mutate(across(fac_var,as.factor))
+
+fr %>% 
+  head(10)
+```
+
+```{r}
+fr %>% 
+  skim()
+```
+
+- LDL,HDLの欠測率が非常に高い(70%超え)ので、欠測処理も有効ではないと判断→この二項目は解析に使わない。
+- その他では最も欠測率が高いGLUでも13%くらいなので、欠測補完で対処できそう。
+
+
+
+
+```{r}
+#continuous var distribution
+
+fr %>% 
+  select(-c(fac_var)) %>% 
+  pivot_longer(cols=everything(),
+               names_to = "term",
+               values_to = "value") %>% 
+  ggplot(aes(x=value))+
+  geom_histogram()+
+  facet_wrap(~term,scales = "free")+
+  #x軸の文字を小さくする
+  theme(axis.text.x = element_text(size=5))
+```
+
+- 連続値（検査値）は妥当な範囲に収まっているのでアーティファクトな外れ値はなさそう→除外処理は不要
+- event timeにおいて、極端に8766が多いのは、end of examであり、censorを意味する
+
+
+## Research Questionの模索
+
+### outcomeの選定
+```{r}
+#stroke
+fr %>% 
+  distinct(RANDID, .keep_all = T) %>%
+  count(STROKE)
+```
+
+Strokeのアウトカム発生数は415あるので、多変量解析で組み込める予測因子の数も十分確保できそう
+
+
+### STROKEと連続変数の関係性（非線形性の検討）
+
+- 単変量での非線形性をRCSで評価
+- あくまでもtime to eventではなく、binaryのoutcomeとの関係性を見ていることに注意
+- Baselineにおける変数の結果とアウトカムの関連を評価→PERIOD=1
+```{r}
+#continuous var
+
+fr %>% 
+  select(-c(fac_var)) %>% 
+  colnames() %>%
+  dput()
+
+cont_var<-c("TOTCHOL", "AGE", "SYSBP", "DIABP", "CIGPDAY", "BMI", "HEARTRTE", "GLUCOSE")
+```
+
+
+```{r}
+#事前準備
+ddist <- datadist(fr) 
+options(datadist='ddist') 
+
+
+#rcs()で変数の非線形を構築、4でknotsを指定
+
+##plot
+rcs_plot<-
+  function(x,n=4,d=fr){
+    #x:explanatory variable 
+    #n:knot number
+    #d=data set
+    
+rcs_formula_str <- paste("STROKE~ rcs(", x, ",",n,")")
+rcs<-lrm(as.formula(rcs_formula_str),data=d) 
+  Predict(rcs) %>% 
+  ggplot()
+}
+
+##stat
+rcs_stat<-function(x,d=fr){
+  #x:explanatory variable
+  #d:data set
+
+  for(i in 1:length(x)){
+    rcs_formula_str <- paste("STROKE~ rcs(", x[i], ",4)")
+    rcs<-lrm(as.formula(rcs_formula_str),data=d) 
+    print(rcs %>% 
+            anova())
+  }
+}
+```
+
+
+```{r}
+library(gridExtra)
+
+#plot in all exam time
+grid.arrange(
+  rcs_plot("AGE"),
+  rcs_plot("SYSBP"),
+  rcs_plot("DIABP"),
+  rcs_plot("CIGPDAY"),
+  rcs_plot("BMI"),
+  rcs_plot("HEARTRTE"),
+  rcs_plot("GLUCOSE"),
+  rcs_plot("TOTCHOL"),
+  ncol=3
+)
+```
+
+- all time examにおける単変量解析で非線形性評価
+- 視覚的に非線形性がありそうなのは、DBP,BMI,HR,TCHO
+- 特にDBP,BMIはU字型で最適な（最もリスクが低い）範囲が有りそう
+- HR,TCHOはある一定の値よりリスク増加の関係性があるように見える
+- かなり強い関連性があるように見えるのは、AGE,SBP,DBP,BMI,HR,GLU
+
+
+```{r}
+#plot in baseline variable
+
+fr_p1<-fr %>% filter(PERIOD==1)
+
+grid.arrange(
+  rcs_plot("AGE",d=fr_p1),
+  rcs_plot("SYSBP",d=fr_p1),
+  rcs_plot("DIABP",d=fr_p1),
+  rcs_plot("CIGPDAY",d=fr_p1),
+  rcs_plot("BMI",d=fr_p1),
+  rcs_plot("HEARTRTE",d=fr_p1),
+  rcs_plot("GLUCOSE",d=fr_p1),
+  rcs_plot("TOTCHOL",d=fr_p1),
+  ncol=3
+)
+```
+
+- Baseline variableにおける非線形性の評価
+- 非線形性がありそうなのはBMI, HR, GLU
+
+```{r}
+#統計解析でも非線形性を一応評価
+
+#rcs_stat(cont_var)
+rcs_stat(cont_var,d=fr_p1)
+```
+
+
+
+### 交互作用の検討
+
+- カテゴリカル変数、連続変数すべての組み合わせで交互作用を検討
+- 使用するvariableを定義
+
+#### data drivenに選択する方法（望ましくない）
+```{r}
+var<-c("SEX", "CURSMOKE", "DIABETES", "BPMEDS", "PREVCHD", "PREVAP", "PREVMI", "PREVSTRK", "PREVHYP", cont_var)
+
+#組み合わせの総数
+choose(length(var),2) #136通り
+
+#交互作用の組み合わせで回帰式作成
+inter_formula<-
+  combn(x=var,m=2) %>%
+  matrix(nrow=136,ncol=2,byrow=T) %>% 
+  as.data.frame() %>% 
+  mutate(inter=str_c(V1,"*",V2),
+         formula=str_c("STROKE~",V1,"+",V2,"+",inter)) 
+
+#上記で作成した回帰式を用いて、尤度比検定を一括で実施
+mat<-matrix(nrow=136,ncol=4,
+              dimnames=list(NULL,c("var","LR","Df","p")))
+
+for(i in 1:nrow(inter_formula)){
+  
+  res<-
+    glm(as.formula(inter_formula$formula[i]),data=fr_p1,family = binomial(link = "logit")) %>% 
+    car::Anova(type=2,test.statistic = "LR") %>% 
+    as.data.frame() %>% 
+    rownames_to_column() %>% 
+    rename("var"="rowname","LR"="LR Chisq","Df"="Df","p"="Pr(>Chisq)") %>% 
+    .[3,] %>% 
+    as.matrix()
+  
+  mat[i,]<-res
+}
+
+#p<0.05の交互作用項を抽出
+mat %>% 
+  as.data.frame() %>% 
+  filter(p<0.05) 
+```
+
+- 尤度比検定で交互作用項がp<0.05になっているものを算出
+- data drivenな交互作用項の選択になっているので、多くの問題をはらんでいる：
+  1. 多重比較の問題
+  2. testimation bias
+  
+- 実際にはこのようなやり方で交互作用項を検討するのは上記のような問題が有り、特に因果推論の文脈では臨床的な仮定に基づきa prioriに交互作用項を選択するのが望ましい。
+- 予測研究においては、最終的に得られるモデルの予測性能にのみ興味があるため、testimation biasによるoverfittingを対処できるのであれば、変数選択に尤度比検定を用いてもいいのかもしれない。今回はこの分野の臨床的なドメイン知識が乏しいので、尤度比検定で交互作用項を選択する。その代わり、回帰モデルではshrinkageによる対処を行う予定。
+
+```{r}
+#交互作用項として選択するもの
+
+mat %>% 
+  as.data.frame() %>% 
+  filter(p<0.05) %>% 
+  select(var) %>% 
+  as.vector() %>% 
+  dput()
+
+inter_var<-c("SEX:PREVCHD", "SEX:PREVAP", "SEX:PREVMI", "SEX:PREVHYP", "SEX:DIABP", "CURSMOKE:HEARTRTE","DIABETES:TOTCHOL", "DIABETES:SYSBP",
+             "BPMEDS:PREVCHD", "BPMEDS:TOTCHOL", "BPMEDS:AGE", "PREVCHD:GLUCOSE", "PREVHYP:BMI", "TOTCHOL:AGE","HEARTRTE:GLUCOSE")
+```
+
+
+### full modelの構築
+
+```{r}
+#nonlinelity term
+nonlin_term<-c("BMI","HEARTRTE","GLUCOSE")
+
+#vecからnonlin_term分の要素を削除
+var[!var %in% nonlin_term]
+
+
+fullmodel<-
+  paste0("STROKE~",
+       str_c(var[!var %in% nonlin_term],collapse = "+"), #非線形以外のvarを＋でつなぐ
+       "+",
+       str_c(paste0("rcs(",nonlin_term,",4)"),collapse = "+"), #非線形のvarを＋でつなぐ
+       "+",
+       str_c(inter_var,collapse = "+")) #交互作用項を＋でつなぐ
+
+fullmodel
+```
+
+### 欠測補完→別のRmdで実行
+
+
+
+
+
+
