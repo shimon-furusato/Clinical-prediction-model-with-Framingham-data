@@ -1,5 +1,8 @@
 # Clinical-prediction-model-with-Framingham-data
-To study clinical prediction, I use framingham data in graduated university.
+To study clinical prediction, I used framingham data.
+The purpose of sharing this code is to brush-up codes and to discuss analysis approach.
+Please review and teach me something mistake or making better codes. 
+
 ## Contents
 1. ["data-cleanup"](framingham_data-cleanup.Rmd) is Rmd file to overview data distribution, missing rates, and clean up data ready-to-analysis.
 2. ["missing imputation"](framingham_missing-imputation.Rmd) is Rmd file. Firsty, I assessed missing ditrtibution and type of missing. Then, I imputate missing term with missForest in R package.
