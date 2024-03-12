@@ -1,0 +1,1040 @@
+---
+title: "framingham_initial-analysis"
+author: "Shimon"
+date: "2024-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#library
+pacman::p_load(
+tidyverse,data.table,tableone,tibble,stringi,readxl,dplyr,scales,ggsci,
+skimr,Epi,janitor,summarytools,broom,easystats,car,rms)
+
+#conflict解消
+select<-dplyr::select 
+
+library(pROC);library(glmnetUtils);library(glmnet);library(ISLR)
+
+```
+
+```{r}
+#factor var
+fac_var<-c("RANDID","SEX", "CURSMOKE", "DIABETES", "BPMEDS","educ","PREVCHD", "PREVAP", "PREVMI", "PREVSTRK", "PREVHYP", "PERIOD", "DEATH", 
+           "ANGINA", "HOSPMI", "MI_FCHD", "ANYCHD", "STROKE", "CVD", "HYPERTEN")
+
+cont_var<-c("TOTCHOL", "AGE", "SYSBP", "DIABP", "CIGPDAY", "BMI", "HEARTRTE", "GLUCOSE")
+
+full_var<-c(fac_var[-c(1,6,12:20)],cont_var)
+
+var<-c("SEX", "CURSMOKE", "DIABETES", "BPMEDS", "PREVCHD", "PREVAP", "PREVMI", "PREVHYP", cont_var) #PREVSTRは除外している
+
+inter_var<-c("SEX:PREVCHD", "SEX:PREVAP", "SEX:PREVMI", "SEX:PREVHYP", "SEX:DIABP", "CURSMOKE:HEARTRTE","DIABETES:TOTCHOL", "DIABETES:SYSBP",
+             "BPMEDS:PREVCHD", "BPMEDS:TOTCHOL", "BPMEDS:AGE", "PREVCHD:GLUCOSE", "PREVHYP:BMI", "TOTCHOL:AGE","HEARTRTE:GLUCOSE")
+
+nonlin_term<-c("BMI","HEARTRTE","GLUCOSE")
+
+#data import
+fr<-read_csv("frmgham2.csv") %>% 
+  mutate(across(fac_var,as.factor))
+
+#欠測補完後データのimport
+load("fr.missf.RData")
+fr.missf<-fr.missf$ximp
+
+
+#plot in baseline variable
+fr_p1<-fr %>% 
+  filter(PERIOD==1)
+
+fr.missf_p1<-
+  fr.missf %>% 
+  filter(PERIOD==1)
+```
+
+
+## full model formula
+```{r}
+# full model formula
+fullmodel<-
+  paste0("STROKE~",
+       str_c(var[!var %in% nonlin_term],collapse = "+"), #非線形以外のvarを＋でつなぐ
+       "+",
+       str_c(paste0("rcs(",nonlin_term,",4)"),collapse = "+"), #非線形のvarを＋でつなぐ
+       "+",
+       str_c(inter_var,collapse = "+")) #交互作用項を＋でつなぐ
+```
+
+
+## full model fitting results
+```{r}
+# Complete case 
+full_results<-
+  glm(as.formula(fullmodel),data=fr_p1,
+      family = binomial(link = "logit")) %>% 
+  summary() %>% 
+  .$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename("var"="rowname") %>% 
+  mutate(OR=exp(Estimate),
+         Lower=exp(Estimate-1.96*`Std. Error`),
+         Upper=exp(Estimate+1.96*`Std. Error`)) %>% 
+  select(var,OR,Lower,Upper,"p"="Pr(>|z|)") %>% 
+  #すべての変数を丸める
+  mutate_if(is.numeric,~round(.,3))
+
+full_results
+```
+
+
+```{r}
+#imputation data
+full_results_mi<-
+  glm(as.formula(fullmodel),data=fr.missf_p1,
+      family = binomial(link = "logit")) %>% 
+  summary() %>% 
+  .$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename("var"="rowname") %>% 
+  mutate(OR=exp(Estimate),
+         Lower=exp(Estimate-1.96*`Std. Error`),
+         Upper=exp(Estimate+1.96*`Std. Error`)) %>% 
+  select(var,OR,Lower,Upper,"p"="Pr(>|z|)") %>% 
+  #すべての変数を丸める
+  mutate_if(is.numeric,~round(.,3))
+
+full_results_mi
+
+```
+
+
+
+```{r}
+full_results_mi %>% 
+  ggplot(aes(y=var,x=OR))+
+  geom_point()+
+  geom_errorbar(aes(xmin=Lower,xmax=Upper),width=0.2)+
+  geom_vline(xintercept=1,color="red")
+```
+
+ORが異常に幅広くなっている因子があるため、sparse data biasがかかっている可能性が高い
+→penalized regressionを行うか、モデル式の変更をすべき状態
+
+Backwards stepwiseとElastic Netによるパラメータ推定を行う
+
+
+
+
+
+## Elastic Netによるパラメータ推定
+
+下準備
+```{r}
+# install.packages("glmnet")
+# install.packages("ISLR")
+# install.packages("glmnetUtils")
+# library(glmnetUtils);library(glmnet);library(ISLR)
+
+```
+### Ridge regression
+```{r}
+#to detect optimal lambda
+ridge.cv.res<-
+  cv.glmnet(
+  x=fr.missf_p1[,var] %>% data.matrix(),
+  y=fr.missf_p1[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  alpha=0)   #ridge
+
+plot(ridge.cv.res) 
+ridge.cv.res$lambda.min #min lambda
+
+# model coefficient with min lambda
+glmnet(
+  x=fr.missf_p1[,var] %>% data.matrix(),
+  y=fr.missf_p1[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  lambda=ridge.cv.res$lambda.min,
+  alpha=0) %>% 
+  .$beta
+```
+
+### Lasso regression
+```{r}
+#to detect optimal lambda
+lasso.cv.res<-
+  cv.glmnet(
+  x=fr.missf_p1[,var] %>% data.matrix(),
+  y=fr.missf_p1[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  alpha=1)   #lasso
+
+#log lambdaとdevianceの関連性plot
+plot(lasso.cv.res)
+
+#devianceが最小のときのlambda
+lasso.cv.res$lambda.min #min lambda
+
+#min lambdaのもとでのlasso regression coefficient；二通りのcodeがあるが、結果は同じ
+
+coef(lasso.cv.res,s="lambda.min") #interceptの値も表示される
+
+glmnet(
+  x=fr.missf_p1[,var] %>% data.matrix(),
+  y=fr.missf_p1[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  lambda=lasso.cv.res$lambda.min,
+  alpha=1) %>% 
+  .$beta　
+
+```
+
+
+### Elastic Net
+
+#### alphaを定める
+Elastic Netでは、Ridge,Lassoの罰則項を割合alphaで混ぜ合わせる事ができる
+当てはまりが最も良い時の最適なalpha求める
+
+```{r}
+#cv.glmnetではなく、cv"a".glmnetを使う; to examine optimal alpha and lambda
+elastic.cv.res<-
+  cva.glmnet(
+  x=fr.missf_p1[,var] %>% data.matrix(),
+  y=fr.missf_p1[,"STROKE"] %>% data.matrix(),
+  family="binomial"
+  ) 
+
+plot(elastic.cv.res)
+ #alphaをデフォルトでは0-1の間で11個に振り分け、それぞれでのdevianceとlambdaの関係性を求める
+
+#各alphaのうち、最もDevianceが小さいときのalphaを探し、その中で最も小さいlambdaを探す
+##alpha=1はlassoと同じ；alpha=0はRidgeと同じということになる
+
+sapply(elastic.cv.res$modlist,"[[","cvm") %>% #各alphaにおけるcvmを取り出す
+  sapply(min) %>% #各alphaの中で最小の値を取り出す
+  min() #すべてのalphaの中で最小のcvmを取り出す
+
+#結果を踏まえると、alpha=1のとき最小の値を示しており、すなわちlassoが最適と考えられる
+
+#alpha=1のときの最小のlamdaを求める
+cv.glmnet(
+  x=fr.missf_p1[,var] %>% data.matrix(),
+  y=fr.missf_p1[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  alpha=1
+  ) %>% 
+  .$lambda.min
+ #これは一個前のchankのlamda minと同じ値になる
+```
+
+最適な(α,λ)は(1,0.001913442)であり、lasso regressionが良いということになる
+
+
+### Lasso model (再掲)
+```{r}
+lasso.cv.res<-
+  cv.glmnet(
+  x=fr.missf_p1[,var] %>% data.matrix(),
+  y=fr.missf_p1[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  alpha=1) 
+
+coef(lasso.cv.res,s="lambda.min") 
+
+
+cf<-coef(lasso.cv.res,s="lambda.min") %>% 
+  as.matrix() %>% 
+  as.data.frame() %>% 
+  mutate(exp=exp(s1)) %>% 
+  add_rownames(var="var") 
+
+#plot
+cf %>% 
+ ggplot(aes(y=var,x=exp))+
+  geom_point()+
+  geom_vline(xintercept=1,color="red")
+  
+```
+
+
+- Lasso regressionでは一部の変数の回帰係数が0にshrinkageしており、実質的に変数選択が行われたことがわかる
+- Shrinkageしたのは、PREVAP, GLUCOSEであり、これらは予測寄与が低いことを意味する
+
+
+### Lasso modelを使った予測性能評価
+
+```{r}
+fr.missf_p1$lasso<-
+  predict(lasso.cv.res,
+        s="lambda.min",
+        newx=fr.missf_p1[,var] %>% data.matrix(),
+        type="response"
+        ) 
+
+fr.missf_p1<-
+  fr.missf_p1 %>% 
+  mutate(STROKEn=as.numeric(STROKE)-1)
+```
+
+
+#### ROC curve
+```{r}
+#ROC curve
+roc.lasso<-
+  roc(STROKEn~lasso,
+    data=fr.missf_p1,
+    ci=T)
+
+roc.lasso
+
+roc.lasso %>% 
+  ggroc(legacy.axes=T)+
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), color="grey", linetype="dashed")
+```
+- AUC=`r roc.lasso$auc`と中等度の予測性能
+
+
+#### Calibration plot
+```{r}
+val.prob(
+  p=fr.missf_p1$lasso,
+  y=fr.missf_p1$STROKEn,
+  g=10,
+  cex=0.5
+)
+
+```
+- Calibration性能はかなり高い事がわかる
+
+
+### BootstrapによるLasso modelの内的妥当性検証
+
+#### optimismの算出
+```{r message=FALSE, warning=FALSE}
+B<-100 #number of resampling 
+N<-dim(fr.missf_p1)[1] #dataのdimentionを返す→4434行x39列→そのうち一番目（4434)を取得しNとする
+AUC.i1<-AUC.i2<-numeric(B) 
+
+for(i in 1:B){  
+
+  #bootstrap random sampling 
+  bs.i<-sample(1:N,N,replace=TRUE) #重複を許して1~4434までの数を4434回サンプリングする
+  
+  #bootstrap samplingに基づき、dataから集団を再構成　→data.iとする
+  fr.missf_p1.i<-fr.missf_p1[bs.i,] 
+  
+  #bootstrapしたデータセットごとで回帰モデル構築→各bootstrap dataからリスク予測確率の算出→data2.1のprob_1列に格納
+  lasso.cv.res.i<-
+  cv.glmnet(
+  x=fr.missf_p1.i[,var] %>% data.matrix(),
+  y=fr.missf_p1.i[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  alpha=1) 
+  
+  fr.missf_p1.i$lasso1<- #lasso1では、bootstrap dataから構築した新しいLasso回帰モデルを使い、そのbootstrap dataに対するリスク予測確率を格納
+  predict(lasso.cv.res.i,
+        s="lambda.min",
+        newx=fr.missf_p1.i[,var] %>% data.matrix(),
+        type="response"
+        )
+  
+  #AUCの算出；Bootstrap回数（B=100)分のAUCを算出して結果を格納；各bootstrap dataに対するAUC
+  AUC.i1[i]<-roc(STROKEn~lasso1,data=fr.missf_p1.i)$auc 
+  
+  #bootstrapで作成した各回帰モデルを使って、オリジナルデータ(fr.missf_p1)に対するリスク予測確率を算出→fr.missf_p1のlasso2列に格納;AUC算出
+  fr.missf_p1$lasso2<-
+    predict(lasso.cv.res.i,
+        s="lambda.min",
+        newx=fr.missf_p1[,var] %>% data.matrix(),
+        type="response"
+        )
+  
+  AUC.i2[i]<-roc(STROKEn~lasso2,data=fr.missf_p1)$auc #ここで得られるAUCはbootstrap dataを用いてoriginal dataに外挿したときのAUC
+  
+  #print(paste(i,"th bootstrap iteration is completed.",sep="")) 
+}  
+
+opt1<-AUC.i1-AUC.i2 
+#(bootstrap samplingした各data setを使い、それぞれ導いた回帰モデルにおけるAUC)ー(bootstrap samplingした各data setを使い、original dataに外挿したときのAUC)
+summary(opt1);hist(opt1)
+```
+
+#### optimismを用いたbias corrected AUCの算出
+      
+```{r}
+lam1<-mean(opt1) #estimate of the optimism 
+
+cor.AUC<-roc.lasso$auc-lam1 #bias corrected AUC estimate
+
+cor.AUC
+```
+
+- Lasso modelによる予測モデル構築を行い、Bootstrapによるbias corrected AUCを算出したところ、`r cor.AUC`であった
+
+**疑問
+- 今回のモデルでは、事前に考えていた非線形性や交互作用項がモデリングに組み込まれなかったが、実際にはそれらの柔軟なモデリングをLassoに適用することはできるのか？交互作用項に関しては、ペアの変数の掛け算項を列結合すれば良さそうだが、非線形性はどのように表現すればよいのかわからない。
+
+
+### Cross validationによる内的妥当性の検証
+```{r}
+#k-fold CV 
+k <-5 
+AUC_CV <-data.frame(matrix(ncol=2,nrow=k)) 
+
+#Randomly shuffle the data 
+fr.missf_p1.r<-fr.missf_p1[sample(nrow(fr.missf_p1)),] 
+ 
+#Create k equally size folds 
+folds <- cut(seq(1,nrow(fr.missf_p1.r)),breaks=k,labels=FALSE) 
+ 
+#Perform k fold cross validation 
+for(i in 1:k){  
+
+  #Segment data2r by fold using the which() function  
+testIndexes <- which(folds==i,arr.ind=TRUE) 
+testData <- fr.missf_p1.r[testIndexes, ] 
+trainData <- fr.missf_p1.r[-testIndexes, ] 
+
+fit1<-
+  cv.glmnet(
+  x=trainData[,var] %>% data.matrix(),
+  y=trainData[,"STROKE"] %>% data.matrix(),
+  family="binomial",
+  alpha=1) 
+
+testData$fitted<-
+  predict(lasso.cv.res,
+        s="lambda.min",
+        newx=testData[,var] %>% data.matrix(),
+        type="response"
+        ) 
+
+ROC <- roc(testData$STROKE, testData$fitted) 
+AUC_CV[i,2] <- ROC$auc 
+AUC_CV[i,1] <- i 
+
+#print(paste(i,"th cross-validation iteration is completed.", sep="")) 
+}  
+
+names(AUC_CV)[2] <- "AUC_cv" 
+names(AUC_CV)[1] <- "k" 
+print(summary(AUC_CV$AUC_cv)) 
+```
+
+- CVによる内的妥当性検証ではAUCは`r mean(AUC_CV$AUC_cv)`であり、Bootstrapによるbias corrected AUC=`r cor.AUC`と遜色ない。 
+
+
+
+## Backward stepwiseによる変数選択とモデリング
+
+ここでは、Lasso modelとの比較可能性を高めるために、2つの回帰モデルを考える
+1. 交互作用項、非線形項を含まない線形の全変数モデル
+2. 交互作用項、非線形項を含む全変数モデル(full model)
+
+
+### 1. 交互作用項、非線形項を含まない線形の全変数モデルを考える(lin_model)
+用いる変数は`r full_var %>% dput()`である
+
+```{r}
+lin_form<-paste("STROKE~",paste(full_var,collapse="+"))
+
+lin_model<-glm(as.formula(lin_form),
+               data=fr.missf_p1,
+               family=binomial(link="logit"))
+
+```
+
+#### VIFの検討
+```{r}
+rms::vif(lin_model)
+```
+- PREVCHD、PREVAPのVIFが高く、多重共線性が疑われるため、PREVCHDを除外して再度VIFを算出
+
+```{r}
+glm(STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVAP + 
+    PREVMI + PREVSTRK + PREVHYP + TOTCHOL + AGE + SYSBP + DIABP + 
+    CIGPDAY + BMI + HEARTRTE + GLUCOSE,
+               data=fr.missf_p1,
+               family=binomial(link="logit")) %>% 
+  rms::vif()
+```
+- 見事に各変数のVIFが低下したため、PREVCHDを除外したモデルを採用する(lin_model2)
+```{r}
+lin_form2<-
+  as.formula(STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVAP + 
+    PREVMI + PREVSTRK + PREVHYP + TOTCHOL + AGE + SYSBP + DIABP + 
+    CIGPDAY + BMI + HEARTRTE + GLUCOSE)
+             
+lin_model2<-glm(lin_form2,
+               data=fr.missf_p1,
+               family=binomial(link="logit"))  
+```
+
+#### Backwards stepwiseによる変数選択
+
+```{r}
+step(lin_model2,
+     direction="both") %>% 
+  summary()
+
+```
+
+- Backwardsの結果、glm(formula = STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVSTRK + 
+    PREVHYP + AGE + DIABP + HEARTRTE, family = binomial(link = "logit"), 
+    data = fr.missf_p1) が最良のモデルとして選ばれた
+    
+    
+```{r}
+stepwise_results<-
+  glm(formula = STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVSTRK + 
+    PREVHYP + AGE + DIABP + HEARTRTE, family = binomial(link = "logit"), 
+    data = fr.missf_p1) %>% 
+  summary() %>% 
+  .$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename("var"="rowname") %>% 
+  mutate(OR=exp(Estimate),
+         Lower=exp(Estimate-1.96*`Std. Error`),
+         Upper=exp(Estimate+1.96*`Std. Error`)) %>% 
+  select(var,OR,Lower,Upper,"p"="Pr(>|z|)") %>% 
+  #すべての変数を丸める
+  mutate_if(is.numeric,~round(.,3))
+
+#結果を表示
+stepwise_results
+```
+```{r}
+#plot
+stepwise_results %>% 
+  #filter(!var=="PREVSTRK1") %>%  #これだけ非常にCIが大きくグラフ化すると視認性が悪いので一時的に削除
+  ggplot(aes(y=var,x=OR))+
+  geom_point()+
+  geom_errorbar(aes(xmin=Lower,xmax=Upper),width=0.2)+
+  geom_vline(xintercept=1,color="red")
+```
+- 変数選択の結果残った変数のうち、PREVSTRKのORが非常に大きくなり、推定が不安定になっている
+- アウトカムとPREVSTROKEの関係を詳しく見てみると、分割表において、
+`r xtabs(~STROKE+PREVSTRK,data=fr.missf_p1)`　
+であり、STROKE=0のとき、PREVSTRK=1に該当する患者が0であることがわかった→これがsparse biasの原因である
+```{r}
+xtabs(~STROKE+PREVSTRK,
+      data=fr.missf_p1)
+```
+ここで、すべてのカテゴリカル変数に対して同様にアウトカムとの分割表を考えてみる
+```{r}
+f<-
+  function(x){
+form<-as.formula(paste("~STROKE+",x))  
+xtabs(form,data=fr.missf_p1)
+  }
+
+for(i in fac_var[-1]){
+  print(f(i))
+}
+
+```
+
+- カテゴリカル変数に対してアウトカムとの分割表を考えてみると、sparseな部分が可視化できるため、事前の変数選択を考える上で非常に有用であることがわかった
+- 今回は、PREVSTRKのみが完全にsparse(cell=0がある)であるため、この変数を除外して再度変数選択を行うこととする（本当はこれを解析前にできればよかった）
+
+PREVSTROKEを除外したモデルにおいて、VIFから再度検討する
+```{r}
+glm(
+  STROKE~ SEX+CURSMOKE+DIABETES+BPMEDS+PREVCHD+PREVAP+PREVMI+PREVHYP+TOTCHOL+AGE+SYSBP+DIABP+CIGPDAY+BMI+HEARTRTE+GLUCOSE,
+               data=fr.missf_p1,
+               family=binomial(link="logit")) %>% 
+  rms::vif()
+#ココでも同様にPREVCHDのVIFが高いため、除外して再度VIFを算出
+glm(
+  STROKE~ SEX+CURSMOKE+DIABETES+BPMEDS+PREVAP+PREVMI+PREVHYP+TOTCHOL+AGE+SYSBP+DIABP+CIGPDAY+BMI+HEARTRTE+GLUCOSE,
+               data=fr.missf_p1,
+               family=binomial(link="logit")) %>% 
+  rms::vif()
+#いい感じ→これを初期モデルとする
+
+lin_model3<-
+  glm(STROKE~ SEX+CURSMOKE+DIABETES+BPMEDS+PREVAP+PREVMI+PREVHYP+TOTCHOL+AGE+SYSBP+DIABP+CIGPDAY+BMI+HEARTRTE+GLUCOSE,
+               data=fr.missf_p1,
+               family=binomial(link="logit"))
+
+```
+
+    
+```{r}
+step(lin_model3,
+     direction="both") %>% 
+  summary()
+```
+
+-Backwardsで最良のモデルとして選ばれたのは
+glm(formula = STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVHYP + 
+    AGE + DIABP + HEARTRTE, family = binomial(link = "logit"), 
+    data = fr.missf_p1)
+    
+    
+```{r}
+stepwise_results<-
+  glm(formula = STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVHYP + 
+    AGE + DIABP + HEARTRTE, family = binomial(link = "logit"), 
+    data = fr.missf_p1) %>% 
+  summary() %>% 
+  .$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename("var"="rowname") %>% 
+  mutate(OR=exp(Estimate),
+         Lower=exp(Estimate-1.96*`Std. Error`),
+         Upper=exp(Estimate+1.96*`Std. Error`)) %>% 
+  select(var,OR,Lower,Upper,"p"="Pr(>|z|)") %>% 
+  #すべての変数を丸める
+  mutate_if(is.numeric,~round(.,3))
+
+#結果を表示
+stepwise_results
+
+#plot
+stepwise_results %>% 
+  ggplot(aes(y=var,x=OR))+
+  geom_point()+
+  geom_errorbar(aes(xmin=Lower,xmax=Upper),width=0.2)+
+  geom_vline(xintercept=1,color="red")
+```
+- ORが発散することなくとてもいい感じの推定ができたので、このモデルを
+1. 交互作用項、非線形項を含まない線形の全変数モデル(lin_model)における最終モデル(lin_final_model)とする
+```{r}
+lin_final_formula<-as.formula(STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVHYP + AGE + DIABP + HEARTRTE)
+
+lin_final_model<-
+  glm(formula = lin_final_formula, 
+      family = binomial(link = "logit"), 
+      #x=T,y=T,
+      data = fr.missf_p1)
+```
+
+
+### 予測性能の評価
+
+#### ROC AUC
+```{r}
+# risk prediction fitting
+fr.missf_p1$fitted.lin.fin<-
+  predict(lin_final_model,
+          type="response") 
+
+# ROC AUC
+roc.lin.final<-
+  roc(STROKE~fitted.lin.fin,
+    data=fr.missf_p1,
+    ci=T)
+
+roc.lin.final
+
+roc.lin.final %>% 
+  ggroc(legacy.axes=T)+
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), color="grey", linetype="dashed")
+```
+- ROCは`r roc.lin.final$auc`であり、中等度の予測性能と考えられる
+
+```{r}
+#calibration plot
+cal.lin.final<-
+  val.prob(
+  p=fr.missf_p1$fitted.lin.fin,
+  y=fr.missf_p1$STROKEn,
+  g=10,
+  cex=0.5) 
+```
+- calibration plotからみても予測性能は高い
+
+
+
+### Bootstrapによるliner final modelの内的妥当性検証
+
+#### optimismの算出
+```{r message=FALSE, warning=FALSE}
+B<-100 #number of resampling 
+N<-dim(fr.missf_p1)[1] #dataのdimentionを返す→4434行x39列→そのうち一番目（4434)を取得しNとする
+AUC.i1<-AUC.i2<-numeric(B) 
+
+for(i in 1:B){  
+
+  #bootstrap random sampling 
+  bs.i<-sample(1:N,N,replace=TRUE) #重複を許して1~4434までの数を4434回サンプリングする
+  
+  #bootstrap samplingに基づき、dataから集団を再構成　→data.iとする
+  fr.missf_p1.i<-fr.missf_p1[bs.i,] 
+  
+  #bootstrapしたデータセットごとで回帰モデル構築→各bootstrap dataからリスク予測確率の算出→data2.1のprob_1列に格納
+  lin.fin.cv.res.i<-
+    glm(formula = lin_final_formula, 
+      family = binomial(link = "logit"), 
+      data = fr.missf_p1.i)
+  
+  fr.missf_p1.i$lin.fin.1<- #lin.fin.1では、bootstrap dataから構築した新しいロジスティク回帰モデルを使い、そのbootstrap dataに対するリスク予測確率を格納
+    predict(lin.fin.cv.res.i,
+            data=fr.missf_p1.i,
+            type="response") 
+ 
+  #AUCの算出；Bootstrap回数（B=100)分のAUCを算出して結果を格納；各bootstrap dataに対するAUC
+  AUC.i1[i]<-roc(STROKE~lin.fin.1,data=fr.missf_p1.i)$auc 
+  
+  
+  #bootstrapで作成した各回帰モデルを使って、オリジナルデータ(fr.missf_p1)に対するリスク予測確率を算出→fr.missf_p1のlin.fin.2列に格納;AUC算出
+  fr.missf_p1$lin.fin.2<-
+    predict(lin.fin.cv.res.i,
+            newdata=fr.missf_p1, ##dataではなくnewdataにする必要がある！！！！
+            type="response") 
+  
+  AUC.i2[i]<-roc(STROKE~lin.fin.2,data=fr.missf_p1)$auc #ここで得られるAUCはbootstrap dataを用いてoriginal dataに外挿したときのAUC
+  
+  #print(paste(i,"th bootstrap iteration is completed.",sep="")) 
+}  
+
+opt2<-AUC.i1-AUC.i2 
+#(bootstrap samplingした各data setを使い、それぞれ導いた回帰モデルにおけるAUC)ー(bootstrap samplingした各data setを使い、original dataに外挿したときのAUC)
+summary(opt2);hist(opt2)
+```
+
+#### optimismを用いたbias corrected AUCの算出
+```{r}
+lam2<-mean(opt2) #estimate of the optimism 
+
+lin.cor.AUC<-roc.lin.final$auc-lam2 #bias corrected AUC estimate
+
+lin.cor.AUC
+```
+
+- Linerity final modelによる予測モデル構築を行い、Bootstrapによるbias corrected AUCを算出したところ、`r lin.cor.AUC`であった
+- 当初、２個目のpredictのdata部分をnewdataにしていなかったためoptimismが非常に大きく出てしまっていた。回帰モデルの内部におけるdataとpredictにおける外挿したいdataが異なるときは、newdataに設定する必要がある
+
+
+### Cross validationによる内的妥当性の検証
+```{r}
+#k-fold CV 
+k <-5 
+AUC_CV <-data.frame(matrix(ncol=2,nrow=k)) 
+
+lin_final_formula<-as.formula(STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVHYP + AGE + DIABP + HEARTRTE)
+
+lin_final_model<-
+  glm(formula = lin_final_formula, 
+      family = binomial(link = "logit"), 
+      data = fr.missf_p1)
+
+#Randomly shuffle the data 
+fr.missf_p1.r<-fr.missf_p1[sample(nrow(fr.missf_p1)),] 
+ 
+#Create k equally size folds 
+folds <- cut(seq(1,nrow(fr.missf_p1.r)),breaks=k,labels=FALSE) 
+ 
+#Perform k fold cross validation 
+for(i in 1:k){  
+
+  #Segment data2r by fold using the which() function  
+testIndexes <- which(folds==i,arr.ind=TRUE) 
+testData <- fr.missf_p1.r[testIndexes, ] 
+trainData <- fr.missf_p1.r[-testIndexes, ] 
+fit1<-glm(formula = lin_final_formula, family = binomial(link = "logit"), data = trainData)
+testData$fitted<-predict(fit1,testData,type="response") 
+ROC <- roc(testData$STROKE, testData$fitted) 
+AUC_CV[i,2] <- ROC$auc 
+AUC_CV[i,1] <- i 
+
+#print(paste(i,"th cross-validation iteration is completed.", sep="")) 
+}  
+
+names(AUC_CV)[2] <- "AUC_cv" 
+names(AUC_CV)[1] <- "k" 
+print(summary(AUC_CV$AUC_cv)) 
+```
+
+
+- CVではAUCの平均値は`r mean(AUC_CV$AUC_cv)`
+
+
+
+
+### 2. 交互作用項、非線形項を含む線形の全変数モデルを考える(full_model)
+用いる変数は`r var %>% dput()`である
+
+- full modelのうち、前述で多重共線性やsparseの問題から削除した変数（PREVSTRK,PREVCHD)を除いたモデルを考える
+
+```{r}
+fullmodel
+glm(as.formula(fullmodel),data=fr.missf_p1,
+      family = binomial(link = "logit")) 
+
+fullmodel2<-
+  STROKE~SEX+CURSMOKE+DIABETES+BPMEDS+PREVAP+PREVMI+PREVHYP+TOTCHOL+AGE+SYSBP+DIABP+CIGPDAY+
+  rcs(BMI,4)+rcs(HEARTRTE,4)+rcs(GLUCOSE,4)+
+  SEX:PREVAP+SEX:PREVMI+SEX:PREVHYP+SEX:DIABP+CURSMOKE:HEARTRTE+DIABETES:TOTCHOL+DIABETES:SYSBP+BPMEDS:TOTCHOL+
+  BPMEDS:AGE+PREVHYP:BMI+TOTCHOL:AGE+HEARTRTE:GLUCOSE
+
+fullmodel3<-STROKE~SEX+CURSMOKE+DIABETES+BPMEDS+PREVAP+PREVMI+PREVHYP+TOTCHOL+AGE+SYSBP+DIABP+CIGPDAY+
+  rcs(BMI,4)+rcs(HEARTRTE,4)+rcs(GLUCOSE,4)+SEX:PREVHYP+SEX:PREVMI
+```
+
+#### VIFの評価
+```{r}
+#dfが大きいのでGVIFを算出するcar::vifを用いる
+glm(as.formula(fullmodel3),data=fr.missf_p1,
+      family = binomial(link = "logit")) %>% 
+  car::vif(type="predictor")
+```
+
+- fullmodel2では交互作用項が多すぎるためか計算不能になるので、臨床的な（感覚的に）視点から交互作用項を減らしたmodel3を考える
+- fullmodel3ではGVIFの問題は気にならないためこのまま進める
+
+#### Backwards stepwiseによる変数選択
+```{r}
+glm(as.formula(fullmodel3),data=fr.missf_p1,
+      family = binomial(link = "logit")) %>% 
+  step(direction="both") %>% 
+  summary()
+```
+
+- glm(formula = STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVMI + 
+    PREVHYP + AGE + DIABP + rcs(HEARTRTE, 4) + SEX:PREVMI, family = binomial(link = "logit"), 
+    data = fr.missf_p1)
+  がモデルとして選ばれた
+  
+  
+```{r}
+stepwise_results<-
+  glm(formula = STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVMI + 
+    PREVHYP + AGE + DIABP + rcs(HEARTRTE, 4) + SEX:PREVMI, family = binomial(link = "logit"), 
+    data = fr.missf_p1) %>% 
+  summary() %>% 
+  .$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename("var"="rowname") %>% 
+  mutate(OR=exp(Estimate),
+         Lower=exp(Estimate-1.96*`Std. Error`),
+         Upper=exp(Estimate+1.96*`Std. Error`)) %>% 
+  select(var,OR,Lower,Upper,"p"="Pr(>|z|)") %>% 
+  #すべての変数を丸める
+  mutate_if(is.numeric,~round(.,3))
+
+#結果を表示
+stepwise_results
+
+#plot
+stepwise_results %>% 
+  ggplot(aes(y=var,x=OR))+
+  geom_point()+
+  geom_errorbar(aes(xmin=Lower,xmax=Upper),width=0.2)+
+  geom_vline(xintercept=1,color="red")
+```
+- 交互作用項のORが増大しており発散気味だが、このまま計算を進める
+
+```{r}
+#複雑なロジスティク回帰モデル
+step_final_model<-
+  glm(formula = STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVMI + 
+    PREVHYP + AGE + DIABP + rcs(HEARTRTE, 4) + SEX:PREVMI, family = binomial(link = "logit"), 
+    data = fr.missf_p1)
+```
+
+
+### 予測性能の評価
+
+#### ROC AUC
+```{r}
+# risk prediction fitting
+fr.missf_p1$fitted.step.fin<-
+  predict(step_final_model,
+          type="response") 
+
+# ROC AUC
+roc.step.final<-
+  roc(STROKE~fitted.step.fin,
+    data=fr.missf_p1,
+    ci=T)
+
+roc.step.final
+
+roc.step.final %>% 
+  ggroc(legacy.axes=T)+
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), color="grey", linetype="dashed")
+```
+
+- 複雑なロジスティク回帰モデル(step_final_model)のROC＿AUCは`r roc.step.final$auc`と中等度の予測性能である
+
+#### Calibration plot
+```{r}
+#calibration plot
+cal.step.final<-
+  val.prob(
+  p=fr.missf_p1$fitted.step.fin,
+  y=fr.missf_p1$STROKEn,
+  g=10,
+  cex=0.5) 
+```
+
+- calibration能は良好だが、liner modelやlassoのほうが当てはまりは視覚的に良さそうに見える
+
+
+
+### Bootstrapによるliner final modelの内的妥当性検証
+
+#### optimismの算出
+```{r message=FALSE, warning=FALSE}
+B<-100 #number of resampling 
+N<-dim(fr.missf_p1)[1] #dataのdimentionを返す→4434行x39列→そのうち一番目（4434)を取得しNとする
+AUC.i1<-AUC.i2<-numeric(B) 
+
+for(i in 1:B){  
+
+  #bootstrap random sampling 
+  bs.i<-sample(1:N,N,replace=TRUE) #重複を許して1~4434までの数を4434回サンプリングする
+  
+  #bootstrap samplingに基づき、dataから集団を再構成　→data.iとする
+  fr.missf_p1.i<-fr.missf_p1[bs.i,] 
+  
+  #bootstrapしたデータセットごとで回帰モデル構築→各bootstrap dataからリスク予測確率の算出→data2.1のprob_1列に格納
+  step.fin.cv.res.i<-
+    glm(formula = STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVMI + 
+    PREVHYP + AGE + DIABP + rcs(HEARTRTE, 4) + SEX:PREVMI, family = binomial(link = "logit"), 
+    data = fr.missf_p1.i)
+  
+  fr.missf_p1.i$step.fin.1<- #step.fin.1では、bootstrap dataから構築した新しいロジスティク回帰モデルを使い、そのbootstrap dataに対するリスク予測確率を格納
+    predict(step.fin.cv.res.i,
+            data=fr.missf_p1.i,
+            type="response") 
+ 
+  #AUCの算出；Bootstrap回数（B=100)分のAUCを算出して結果を格納；各bootstrap dataに対するAUC
+  AUC.i1[i]<-roc(STROKE~step.fin.1,data=fr.missf_p1.i)$auc 
+  
+  
+  #bootstrapで作成した各回帰モデルを使って、オリジナルデータ(fr.missf_p1)に対するリスク予測確率を算出→fr.missf_p1のlin.fin.2列に格納;AUC算出
+  fr.missf_p1$step.fin.2<-
+    predict(step.fin.cv.res.i,
+            newdata=fr.missf_p1,
+            type="response") 
+  
+  AUC.i2[i]<-roc(STROKE~step.fin.2,data=fr.missf_p1)$auc #ここで得られるAUCはbootstrap dataを用いてoriginal dataに外挿したときのAUC
+  
+  #print(paste(i,"th bootstrap iteration is completed.",sep="")) 
+}  
+
+opt3<-AUC.i1-AUC.i2 
+#(bootstrap samplingした各data setを使い、それぞれ導いた回帰モデルにおけるAUC)ー(bootstrap samplingした各data setを使い、original dataに外挿したときのAUC)
+summary(opt3);hist(opt3)
+```
+
+```{r}
+lam3<-mean(opt3) #estimate of the optimism 
+
+step.cor.AUC<-roc.step.final$auc-lam3 #bias corrected AUC estimate
+
+step.cor.AUC
+```
+
+- liner modelと同じく、複雑なロジスティク回帰モデルでもoptimismが大きく、非常にoverfittingが生じていることが示唆される
+
+
+### Cross validationによる内的妥当性の検証
+```{r}
+#k-fold CV 
+k <-5 
+AUC_CV <-data.frame(matrix(ncol=2,nrow=k)) 
+
+#Randomly shuffle the data 
+fr.missf_p1.r<-fr.missf_p1[sample(nrow(fr.missf_p1)),] 
+ 
+#Create k equally size folds 
+folds <- cut(seq(1,nrow(fr.missf_p1.r)),breaks=k,labels=FALSE) 
+ 
+#Perform k fold cross validation 
+for(i in 1:k){  
+
+  #Segment data2r by fold using the which() function  
+testIndexes <- which(folds==i,arr.ind=TRUE) 
+testData <- fr.missf_p1.r[testIndexes, ] 
+trainData <- fr.missf_p1.r[-testIndexes, ] 
+fit1<-
+  glm(formula = STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVMI + 
+    PREVHYP + AGE + DIABP + rcs(HEARTRTE, 4) + SEX:PREVMI, family = binomial(link = "logit"), 
+    data = trainData)
+testData$fitted<-predict(fit1,testData,type="response") 
+ROC <- roc(testData$STROKE, testData$fitted) 
+AUC_CV[i,2] <- ROC$auc 
+AUC_CV[i,1] <- i 
+
+#print(paste(i,"th cross-validation iteration is completed.", sep="")) 
+}  
+
+names(AUC_CV)[2] <- "AUC_cv" 
+names(AUC_CV)[1] <- "k" 
+print(summary(AUC_CV$AUC_cv)) 
+```
+
+- CVではAUCはオリジナルデータにおけるAUC: `r roc.step.final$auc`よりも多少小さく（`r mean(AUC_CV$AUC_cv)`）なった
+
+
+### Bootstrapを別の関数を用いて再度検証
+
+#### 使うモデルはSimple model(lin_final_formula)
+STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVHYP + AGE + DIABP + HEARTRTE
+```{r}
+lin_final_formula<-as.formula(STROKE ~ CURSMOKE + DIABETES + BPMEDS + PREVHYP + AGE + DIABP + HEARTRTE)
+
+lin_final_model.lrm<-
+  lrm(lin_final_formula,
+    x=T,
+    y=T,
+    data=fr.missf_p1)
+
+boot<-validate(lin_final_model.lrm,
+         bw=FALSE,
+         B=100,
+         method="boot")
+
+boot
+
+corrected.AUC<-boot[1,5]*0.5 + 0.5 #corrected AUC=Somer's D/2 + 0.5
+```
+
+- rmsによるBootstrapでは、corrected AUC=`r corrected.AUC`であった。
+- こちらのコードのほうが非常にシンプルで、様々な結果が出てくる
+- bias corrected AUCはSomer's D/2 + 0.5で算出する必要があるのが厄介ではあるが。
+
+#### Complex modelでも同様に実施
+formula = STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVMI + 
+    PREVHYP + AGE + DIABP + rcs(HEARTRTE, 4) + SEX:PREVMI
+```{r}
+step_final_model.lrm<-
+  lrm(STROKE ~ SEX + CURSMOKE + DIABETES + BPMEDS + PREVMI + 
+    PREVHYP + AGE + DIABP + rcs(HEARTRTE, 4) + SEX:PREVMI,
+    x=T,
+    y=T,
+    data=fr.missf_p1
+    )
+
+boot2<-validate(step_final_model.lrm,
+         bw=FALSE,
+         B=100,
+         method="boot")
+
+boot2
+
+corrected.AUC2<-boot2[1,5]*0.5 + 0.5 #AUC=Somer's D/2 + 0.5
+
+
+corrected.AUC2
+```
+
+
+
+
+
+
